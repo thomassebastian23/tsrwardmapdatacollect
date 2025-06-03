@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>KML Geofencing with Upload & Live GPS</title>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <style>
+    body { margin: 0; padding: 0; font-family: Arial; }
+    .controls { padding: 10px; background: #f9f9f9; }
+    #map { height: 90vh; width: 100%; }
+    .selected { stroke: red !important; fill: red !important; fill-opacity: 0.3 !important; }
+    #warningMessage {
+      color: red;
+      font-weight: bold;
+      display: none;
+      margin-top: 10px;
+    }
+    #usernameInput {
+      margin-left: 10px;
+      padding: 4px;
+      width: 180px;
+    }
+  </style>
+</head>
+<body>
+  <div class="controls">
+    <input type="file" id="kmlUpload" accept=".kml" />
+    <button id="locateBtn">Show My Location</button>
+    <button id="trackBtn">Start Live Tracking</button>
+    <select id="layerSelect">
+      <option value="">-- Select Boundary --</option>
+    </select>
+    <input type="text" id="usernameInput" placeholder="Enter your name" />
+    <button id="downloadRouteBtn">Download Route KML</button>
+    <div id="warningMessage">Warning: You are outside the selected geofence!</div>
+  </div>
+  <div id="map"></div>
+
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="https://unpkg.com/@tmcw/togeojson@4.0.0/dist/togeojson.umd.js"></script>
+  <script src="https://unpkg.com/@turf/turf@6.5.0/turf.min.js"></script>
+
+  <script>
+    const map = L.map('map').setView([10.5276, 76.2144], 12);
+
+    const satellite = L.tileLayer('https://{s}.google.com/vt/lyrs=s,h&x={x}&y={y}&z={z}', {
+      subdomains: ['mt0', 'mt1', 'mt2', 'mt3'],
+      maxZoom: 20,
+      attribution: '© Google'
+    }).addTo(map);
+
+    let geofenceLayer = L.layerGroup().addTo(map);
+    let selectedLayer = null;
+    let userMarker = null;
+    let trackingId = null;
+    let insideGeofence = false;
+    const routeCoordinates = [];
+    let routeLine = null;
+    const warningMessage = document.getElementById('warningMessage');
+    const layerSelect = document.getElementById('layerSelect');
+    const layerMap = new Map();
+
+    const defaultIcon = L.icon({
+      iconUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-icon.png',
+      iconSize: [25, 41],
+      iconAnchor: [12, 41],
+      shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png'
+    });
+
+    const warningIcon = L.icon({
+      iconUrl: 'https://raw.githubusercontent.com/pointhi/leaflet-color-markers/master/img/marker-icon-red.png',
+      iconSize: [25, 41],
+      iconAnchor: [12, 41],
+      shadowUrl: 'https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png'
+    });
+
+    // Load GitHub KML
+    fetch('https://raw.githubusercontent.com/thomassebastian23/kml-map/main/THRISSUR%20WARD%20MAP%20(2).kml')
+      .then(res => res.text())
+      .then(kmlText => loadKmlToMap(kmlText))
+      .catch(err => alert("Error loading default KML: " + err));
+
+    // Upload user KML
+    document.getElementById('kmlUpload').addEventListener('change', function (e) {
+      const file = e.target.files[0];
+      const reader = new FileReader();
+      reader.onload = () => loadKmlToMap(reader.result);
+      reader.readAsText(file);
+    });
+
+    // Load and display KML data
+    function loadKmlToMap(kmlText) {
+      const parser = new DOMParser();
+      const kml = parser.parseFromString(kmlText, 'text/xml');
+      const geoJson = toGeoJSON.kml(kml);
+
+      const newLayer = L.geoJSON(geoJson, {
+        style: { color: 'blue', weight: 2 },
+        onEachFeature: (feature, layer) => {
+          const name = feature.properties.name || 'Unnamed ' + Math.random().toFixed(4);
+          layer.bindPopup(name);
+          layerMap.set(name, layer);
+
+          // Check if option already exists to avoid duplicates on multiple loads
+          if (![...layerSelect.options].some(o => o.value === name)) {
+            const option = document.createElement('option');
+            option.value = name;
+            option.textContent = name;
+            layerSelect.appendChild(option);
+          }
+
+          layer.on('click', () => {
+            if (selectedLayer) selectedLayer.setStyle({ color: 'blue' });
+            selectedLayer = layer;
+            layer.setStyle({ color: 'red', fillColor: 'red', fillOpacity: 0.3 });
+            layer.openPopup();
+            layerSelect.value = name;
+          });
+        }
+      });
+
+      newLayer.addTo(geofenceLayer);
+      map.fitBounds(newLayer.getBounds());
+    }
+
+    // Layer selection change
+    layerSelect.addEventListener('change', () => {
+      const name = layerSelect.value;
+      if (!name || !layerMap.has(name)) return;
+
+      if (selectedLayer) selectedLayer.setStyle({ color: 'blue' });
+      selectedLayer = layerMap.get(name);
+      selectedLayer.setStyle({ color: 'red', fillColor: 'red', fillOpacity: 0.3 });
+      selectedLayer.openPopup();
+      map.fitBounds(selectedLayer.getBounds());
+      insideGeofence = false;
+      warningMessage.style.display = 'none';
+    });
+
+    // Show user location once
+    document.getElementById('locateBtn').addEventListener('click', () => {
+      navigator.geolocation.getCurrentPosition(pos => {
+        const { latitude, longitude } = pos.coords;
+        updateUserLocation(latitude, longitude);
+        checkInsideGeofence(latitude, longitude);
+      }, err => alert("Geolocation error: " + err.message));
+    });
+
+    // Track user location live
+    document.getElementById('trackBtn').addEventListener('click', function () {
+      if (trackingId !== null) {
+        navigator.geolocation.clearWatch(trackingId);
+        trackingId = null;
+        this.textContent = 'Start Live Tracking';
+        return;
+      }
+
+      trackingId = navigator.geolocation.watchPosition(pos => {
+        const { latitude, longitude } = pos.coords;
+        updateUserLocation(latitude, longitude);
+        checkInsideGeofence(latitude, longitude);
+      }, err => alert("Tracking error: " + err.message), { enableHighAccuracy: true });
+
+      this.textContent = 'Stop Live Tracking';
+    });
+
+    // Update user marker & route
+    function updateUserLocation(lat, lng) {
+      if (userMarker) {
+        userMarker.setLatLng([lat, lng]);
+      } else {
+        userMarker = L.marker([lat, lng], { icon: defaultIcon }).addTo(map).bindPopup("You");
+      }
+      map.setView([lat, lng], 15);
+      routeCoordinates.push([lng, lat]);
+
+      if (routeLine) {
+        routeLine.setLatLngs(routeCoordinates.map(c => [c[1], c[0]]));
+      } else {
+        routeLine = L.polyline(routeCoordinates.map(c => [c[1], c[0]]), { color: 'blue' }).addTo(map);
+      }
+    }
+
+    // Geofence detection
+    function checkInsideGeofence(lat, lng) {
+      if (!selectedLayer) return;
+
+      const point = turf.point([lng, lat]);
+      const polygon = selectedLayer.toGeoJSON();
+      const inside = turf.booleanPointInPolygon(point, polygon);
+
+      if (inside && !insideGeofence) {
+        alert("Entered geofence: " + (selectedLayer.feature.properties.name || "Unnamed"));
+        insideGeofence = true;
+        warningMessage.style.display = 'none';
+        if (userMarker) userMarker.setIcon(defaultIcon);
+      } else if (!inside && insideGeofence) {
+        alert("Exited geofence!");
+        insideGeofence = false;
+        warningMessage.style.display = 'block';
+        if (userMarker) userMarker.setIcon(warningIcon);
+      } else if (!inside) {
+        warningMessage.style.display = 'block';
+        if (userMarker) userMarker.setIcon(warningIcon);
+      } else {
+        warningMessage.style.display = 'none';
+        if (userMarker) userMarker.setIcon(defaultIcon);
+      }
+    }
+
+    // Download route as KML with username in filename
+    document.getElementById('downloadRouteBtn').addEventListener('click', async () => {
+      if (!routeCoordinates.length) return alert("No route to export.");
+      const username = document.getElementById('usernameInput').value.trim();
+      if (!username) return alert("Please enter your name before downloading.");
+      const name = prompt("Enter filename:", "route") || "route";
+      const filename = `${username}_${name}`;
+      const kml = generateKML(routeCoordinates);
+      const blob = new Blob([kml], { type: 'application/vnd.google-earth.kml+xml' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename + '.kml';
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    function generateKML(coords) {
+      return `<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>User Route</name>
+<Placemark><name>Route</name><LineString><coordinates>
+${coords.map(c => `${c[0]},${c[1]},0`).join('\n')}
+</coordinates></LineString></Placemark></Document></kml>`;
+    }
+  </script>
+</body>
+</html>
